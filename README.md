@@ -39,13 +39,12 @@ By default the APC is setup to accept input from Mic. Change the APC macro value
 #### MAIN_BTN
 
 + single-click: (play) play current section
-+ double-click: (fwd)  move to next occupied section and play
 + long-press:   (rec)  start recording into first vacant section
 
 #### SUB_BTN
 
-+ single-click: erase current section
-+ long-press:   erase entire memory
++ single-click: forward
++ long-press:   erase current slot
 
 ### LEDs
 
