@@ -13,34 +13,34 @@
 #include <avr/power.h>
 #include <avr/sleep.h>
 #include <avr/io.h>
-#include <prescaler.h>
 #include <EEPROM.h>
 #include <ISD1700.h>
 #include <OneButton.h>
 #include <Timer.h>
+#include <MsTimer2.h>
 
 #define SS 10
 #define FIRST_ADDR 0x010
-#define LAST_ADDR 0x2df
+#define LAST_ADDR 0x3cf //3cf for 120, 2df for 90
 #define APC 0xE1 //000011100001
 #define SLOT_NUM 5
 
-#define MAIN_BTN 3
-#define SUB_BTN  2
+#define MAIN_BTN 3 //3
+#define SUB_BTN  2 //2
 
-#define LEDI 14 //1 for D1, 14 for A0
+#define LEDI 4 //1 for D1, 14 for A0
 #define LEDN 5
 #define LEDFREQ 100
 #define LEDREP 5
 
-#define REC_TIMEUP ((90 * 1000) / SLOT_NUM)
+#define REC_TIMEUP ((120 * 1000) / SLOT_NUM)
 #define AVR_PWR_DWN_TIME 3000
 
-int digitalPinToInterrupt(int d) {
+/*int digitalPinToInterrupt (int d) {
   if (d == 2) return 0;
   if (d == 3) return 1;
   return -1;
-}
+}*/
 
 int interrupt_main_btn = digitalPinToInterrupt(MAIN_BTN);
 int interrupt_sub_btn = digitalPinToInterrupt(SUB_BTN);
@@ -62,6 +62,7 @@ uint16_t apc = 0;
 uint16_t slot_addrs[SLOT_NUM];
 uint16_t end_addrs[SLOT_NUM];
 int cur_slot = 0;
+int slot_occup[SLOT_NUM];
 
 bool recording = false;
 
@@ -74,7 +75,6 @@ void setup() {
   DDRB = B00000000;        // set pins 8 to 13 as inputs
   PORTD |= B11111100;      // enable pullups on pins 2 to 7
   PORTB |= B11111111;      // enable pullups on pins 8 to 13
-  setClockPrescaler(CLOCK_PRESCALER_1); 
   
   // re-set pin-mode for SPI after above setting
   pinMode(SCK_PIN, OUTPUT);
@@ -95,7 +95,7 @@ void setup() {
   btn.attachLongPressStart(rec);
   btn.attachLongPressStop(rec_end);
   btn2.attachClick(forward);
-  btn2.attachLongPressStop(erase_one);
+  btn2.attachLongPressStart(erase_one);
   digitalWrite(SS, HIGH); // just to ensure
   while (!chip_wakeup())
     delay(10);
@@ -107,15 +107,16 @@ void setup() {
   apc |= APC;
   chip.wr_apc2(apc);
   check_chip_err();
-
-  //erase
-  
+    
   /*chip.g_erase();
   for (i=0; i<SLOT_NUM; i++)
     EEPROM[i] = 0;
   check_chip_err();*/
+
+  sync_eeprom();
   
-  led_update();
+  MsTimer2::set(4, led_update);
+  MsTimer2::start();
 
   //setup memory management
   for (i=0; i<SLOT_NUM; i++) {
@@ -125,7 +126,13 @@ void setup() {
   }
 
   chip.pd();
-  avr_sleep();
+  //avr_sleep();
+}
+
+void sync_eeprom () {
+  int i;
+  for (i=0; i<SLOT_NUM; i++)
+    slot_occup[i] = EEPROM[i];  //sync eeprom status with array
 }
 
 bool chip_wakeup () {
@@ -169,12 +176,12 @@ void attempt_pd () {
 
 void playback () {
   Serial.println("button action: playback");
-  if ( ! EEPROM[cur_slot]) return;
+  if ( ! slot_occup[cur_slot]) return;
   if ( ! chip_wakeup()) return;
   chip.set_play(slot_addrs[cur_slot], end_addrs[cur_slot]);
   if (check_chip_err()) return;
-  tim.stop(tim_id);
-  tim_id = tim.oscillate(LEDI+cur_slot, LEDFREQ, HIGH, LEDREP);
+  register_led_oscillation(cur_slot, LEDFREQ);
+  tim_id = tim.after(5000, cancel_led_oscillation);
   chip_cleanup();
 }
 
@@ -184,11 +191,19 @@ void forward () {
   chip.stop();
   //chip.fwd();
   cur_slot = next_occupied_slot(cur_slot);
+  if (cur_slot == 0 && ! slot_occup[cur_slot]) return; //no recording
   chip.set_play(slot_addrs[cur_slot], end_addrs[cur_slot]);
   if (check_chip_err()) return;
-  tim.stop(tim_id);
-  tim_id = tim.oscillate(LEDI+cur_slot, LEDFREQ, HIGH, LEDREP);
+  register_led_oscillation(cur_slot, LEDFREQ);
+  tim_id = tim.after(5000, cancel_led_oscillation);
   chip_cleanup();
+}
+
+void write_eeprom (int i, byte x) {
+  EEPROM.write(i, x);
+  slot_occup[i] = x;
+  tim.stop(tim_id);
+  cancel_led_oscillation();
 }
 
 void rec () {
@@ -199,9 +214,8 @@ void rec () {
   if (next_slot < 0) return;
   recording = true;
   chip.set_rec(slot_addrs[next_slot], end_addrs[next_slot]);
-  tim.stop(tim_id);
-  tim_id = tim.oscillate(LEDI+next_slot, LEDFREQ, HIGH);
-  EEPROM.write(next_slot, 1);
+  write_eeprom(next_slot, 1);
+  register_led_oscillation(next_slot, LEDFREQ);
   cur_slot = next_slot;
   r_tu_t_id = tim.after(REC_TIMEUP, rec_end); //ensure rec_end gets called
 }
@@ -210,12 +224,11 @@ void rec_end () {
   if (! recording) return;
   recording = false;
   Serial.println("rec end");
-  tim.stop(tim_id);
+  cancel_led_oscillation();
   tim.stop(r_tu_t_id);
   delay(10);
   if (check_chip_err()) return;
   chip.stop();
-  led_update();
   chip_cleanup();
 }
 
@@ -223,9 +236,8 @@ void erase_one () {
   if ( ! chip_wakeup()) return;
   chip.set_erase(slot_addrs[cur_slot], end_addrs[cur_slot]);
   delay(10);
-  if (check_chip_err()) return;
-  EEPROM.write(cur_slot, 0);
-  led_update();
+  //if (check_chip_err()) return;
+  write_eeprom(cur_slot, 0);
   cur_slot = next_occupied_slot(cur_slot);
   chip_cleanup();
 }
@@ -237,22 +249,45 @@ void erase_all () {
   delay(10);
   if (check_chip_err()) return;
   for (i=0; i<SLOT_NUM; i++)
-    EEPROM[i] = 0;
-  led_update();
+    write_eeprom(i, 0);
   cur_slot = 0;
   chip_cleanup();
 }
 
+//interrupt function
+int rom_i = 0;
+int led_i_max = LEDI+(LEDN-1);
+volatile int osc_i = -1;
+volatile int osc_st = 0;
 void led_update () {
-  int i;
-  tim.stop(tim_id);
-  //led display update
-  for (i=0; i<SLOT_NUM; i++) {
-    if (EEPROM[i])
-      digitalWrite(LEDI+i, HIGH);
-    else
-      digitalWrite(LEDI+i, LOW);
+  //led display update LOW = ON
+  if (rom_i > SLOT_NUM-1) {
+    rom_i = 0;
+    digitalWrite(led_i_max, HIGH);
+  } else {
+    digitalWrite(LEDI+rom_i - 1, HIGH);
   }
+  
+  //osc
+  if (rom_i == osc_i) {
+    digitalWrite(LEDI+rom_i, !osc_st);
+    osc_st = !osc_st;
+  }
+  //slot occupation indication
+  else if (slot_occup[rom_i])
+    digitalWrite(LEDI+rom_i, LOW);
+  else
+    digitalWrite(LEDI+rom_i, HIGH);
+  rom_i++;
+}
+
+void register_led_oscillation (int rom_i, int freq) {
+  tim.stop(tim_id);
+  osc_i = rom_i;
+}
+
+void cancel_led_oscillation () {
+  osc_i = -1;
 }
 
 bool check_chip_err () {
@@ -263,34 +298,33 @@ bool check_chip_err () {
 
 void led_off () {
   int i;
+  MsTimer2::stop();
   for (i=0; i<SLOT_NUM; i++)
-    digitalWrite(LEDI+i, LOW);
+    digitalWrite(LEDI+i, HIGH);
 }
 
 void error_pattern () {
   int i;
-  for (i=0; i<SLOT_NUM; i++)
-    digitalWrite(LEDI+i, LOW);
-  for (i=0; i<SLOT_NUM; i++) {
-    digitalWrite(LEDI+i, HIGH);
-    delay(100);
-  }
-  for (i=SLOT_NUM-1; i>-1; i--) {
-    digitalWrite(LEDI+i, LOW);
-    delay(100);
-  }
-  led_update();
+  for (i=0; i < SLOT_NUM; i++)
+    slot_occup[i] = 1; //enable all leds
+  MsTimer2::stop();
+  cancel_led_oscillation();
+  MsTimer2::set(300, led_update);
+  MsTimer2::start();
+  delay(1000);
+  sync_eeprom(); //restore slot occupation status
+  MsTimer2::stop();
+  MsTimer2::set(4, led_update);
+  MsTimer2::start();
 }
 
 void led_notwakeup_pattern () {
-  for (int i = 0; i < 3; i++)
-    error_pattern();
-  led_update();
+  error_pattern();
 }
 
 int next_available_slot (int cur) {
   for (int i=0; i<SLOT_NUM; i++) {
-    if ( ! EEPROM[i]) return i;
+    if ( ! slot_occup[i]) return i;
   }
   return -1;
 }
@@ -298,7 +332,7 @@ int next_available_slot (int cur) {
 int next_occupied_slot (int cur) {
   int nxt = (cur + 1) % SLOT_NUM;
   for (int i=nxt; i<SLOT_NUM+nxt; i++) {
-    if (EEPROM[i % SLOT_NUM]) return i % SLOT_NUM;
+    if (slot_occup[i % SLOT_NUM]) return i % SLOT_NUM;
   }
   return 0;
 }
@@ -324,7 +358,9 @@ void avr_sleep () {
   
   sleep_disable(); //Wait for an interrupt, disable, and continue
   Serial.println("Arduino Wakeup");
-  led_update();
+  sync_eeprom();
+  MsTimer2::set(4, led_update);
+  MsTimer2::start();
 }
 
 /* 
